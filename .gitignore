@@ -1,0 +1,5 @@
+.venv/
+IMDB TMDB Movie Metadata Big Dataset (1M).csv
+.idea/
+__pycache__/
+*.pyc
