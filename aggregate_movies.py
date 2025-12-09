@@ -1,20 +1,39 @@
 import redis
 import json
 import ast
+import sys
 
 redis_db = redis.Redis(host='localhost', port=6379, db=0)
+
+# Configuration: Number of movies to aggregate (should match loading_dataset.py)
+NUM_ROWS = 5000  # Default
+
+# Allow command line override
+if len(sys.argv) > 1:
+    try:
+        NUM_ROWS = int(sys.argv[1])
+        print(f"Will aggregate up to {NUM_ROWS} movies (from command line)")
+    except ValueError:
+        print(f"Invalid argument, using default: {NUM_ROWS} movies")
+else:
+    print(f"Will aggregate up to {NUM_ROWS} movies (default)")
 
 def aggregate_data():
 
     # CLEAN old aggregation keys to avoid type conflicts
     print("Cleaning up old aggregation keys...")
-    for prefix in ["genre:", "actor:", "year:", "top_rated:"]:
+    prefixes = [
+        "genre:", "actor:", "year:", "top_rated:", "director:", "country:",
+        "language:", "zset:imdb_rating", "zset:vote_average", "zset:budget",
+        "zset:revenue", "zset:runtime", "zset:popularity", "zset:vote_count"
+    ]
+    for prefix in prefixes:
         for key in redis_db.scan_iter(f"{prefix}*"):
             redis_db.delete(key)
     print("Cleanup complete.")
 
     # SCAN all movies
-    LIMIT = 5000  # Adjust limit as needed
+    LIMIT = NUM_ROWS  # Use the configured limit
     processed = 0
     cursor = 0
     print("Starting data aggregation...")
@@ -31,9 +50,36 @@ def aggregate_data():
             try:
                 movie = json.loads(data)
                 movie_id = str(movie.get("id"))
-                vote_avg = float(movie.get("vote_average", 0))
+                movie_key = f"movie:{movie_id}"
 
-                # Parse release year
+                # ============================================
+                # Extract and parse all fields
+                # ============================================
+
+                # Ratings
+                vote_avg = movie.get("vote_average")
+                vote_avg = float(vote_avg) if vote_avg not in (None, "", "nan") else 0.0
+
+                imdb_rating = movie.get("IMDB_Rating")
+                imdb_rating = float(imdb_rating) if imdb_rating not in (None, "", "nan") else 0.0
+
+                # Numeric fields
+                budget = movie.get("budget")
+                budget = float(budget) if budget not in (None, "", "nan") else 0.0
+
+                revenue = movie.get("revenue")
+                revenue = float(revenue) if revenue not in (None, "", "nan") else 0.0
+
+                runtime = movie.get("runtime")
+                runtime = float(runtime) if runtime not in (None, "", "nan") else 0.0
+
+                popularity = movie.get("popularity")
+                popularity = float(popularity) if popularity not in (None, "", "nan") else 0.0
+
+                vote_count = movie.get("vote_count")
+                vote_count = float(vote_count) if vote_count not in (None, "", "nan") else 0.0
+
+                # Release year
                 year_raw = movie.get("release_year")
                 year = None
                 try:
@@ -44,8 +90,15 @@ def aggregate_data():
                 except:
                     year = None
 
-                # Parse main actor
-                main_cast = movie.get("Star1")
+                # Language
+                language = movie.get("original_language", "").strip()
+
+                # Director
+                director = movie.get("director", "").strip()
+
+                # Main actor (Star1)
+                main_cast = movie.get("Star1", "").strip()
+
                 # Parse genres list safely
                 genres_raw = movie.get("genres_list", "[]")
                 try:
@@ -54,36 +107,98 @@ def aggregate_data():
                 except:
                     genres = []
 
+                # Parse production countries
+                countries_raw = movie.get("production_countries", "")
+                countries = []
+                try:
+                    if isinstance(countries_raw, str) and countries_raw:
+                        # Try to parse as list
+                        if countries_raw.startswith('['):
+                            countries = ast.literal_eval(countries_raw)
+                            countries = [str(c).strip() for c in countries if c]
+                        else:
+                            # Plain text, split by common delimiters
+                            countries = [c.strip() for c in countries_raw.split(',')]
+                except:
+                    countries = []
+
+                # ============================================
+                # Create indexes and sorted sets
+                # ============================================
+
                 if movie_id:
-                    movie_key = f"movie:{movie_id}"
+                    # Actor index (SET)
+                    if main_cast:
+                        redis_db.sadd(f"actor:{main_cast}", movie_key)
 
-                    # Actor aggregation
-                    if main_cast and isinstance(main_cast, str):
-                        actor_clean = main_cast.strip()
-                        if actor_clean:
-                            redis_db.sadd(f"actor:{actor_clean}", movie_key)
+                    # Director index (SET)
+                    if director:
+                        redis_db.sadd(f"director:{director}", movie_key)
 
-                    # Genre aggregation and top rated zset
+                    # Genre indexes (SET + sorted set for ratings)
                     for genre in genres:
                         if genre:
                             redis_db.sadd(f"genre:{genre}", movie_key)
-                            redis_db.zadd(f"top_rated:{genre}", {movie_key: vote_avg})
+                            if vote_avg > 0:
+                                redis_db.zadd(f"top_rated:{genre}", {movie_key: vote_avg})
 
-                    # Year aggregation
+                    # Year index (SET)
                     if year:
                         redis_db.sadd(f"year:{year}", movie_key)
+
+                    # Language index (SET)
+                    if language:
+                        redis_db.sadd(f"language:{language}", movie_key)
+
+                    # Country indexes (SET)
+                    for country in countries:
+                        if country:
+                            redis_db.sadd(f"country:{country}", movie_key)
+
+                    # ============================================
+                    # Sorted sets for numeric fields (for range queries)
+                    # ============================================
+
+                    if imdb_rating > 0:
+                        redis_db.zadd("zset:imdb_rating", {movie_key: imdb_rating})
+
+                    if vote_avg > 0:
+                        redis_db.zadd("zset:vote_average", {movie_key: vote_avg})
+
+                    if budget > 0:
+                        redis_db.zadd("zset:budget", {movie_key: budget})
+
+                    if revenue > 0:
+                        redis_db.zadd("zset:revenue", {movie_key: revenue})
+
+                    if runtime > 0:
+                        redis_db.zadd("zset:runtime", {movie_key: runtime})
+
+                    if popularity > 0:
+                        redis_db.zadd("zset:popularity", {movie_key: popularity})
+
+                    if vote_count > 0:
+                        redis_db.zadd("zset:vote_count", {movie_key: vote_count})
 
                 processed += 1
                 if processed % 100 == 0:
                     print(f"Processed {processed} movies...")
 
             except Exception as e:
-                print(f"Error processing {key.decode()}: {e}")
+                print(f"Error processing {key.decode() if isinstance(key, bytes) else key}: {e}")
 
         if cursor == 0 or processed >= LIMIT:
             break
 
     print(f"✅ Aggregation completed for {processed} movies.")
+    print(f"\n📊 Index Summary:")
+    print(f"   - Actor keys: {len(list(redis_db.scan_iter('actor:*')))}")
+    print(f"   - Director keys: {len(list(redis_db.scan_iter('director:*')))}")
+    print(f"   - Genre keys: {len(list(redis_db.scan_iter('genre:*')))}")
+    print(f"   - Year keys: {len(list(redis_db.scan_iter('year:*')))}")
+    print(f"   - Language keys: {len(list(redis_db.scan_iter('language:*')))}")
+    print(f"   - Country keys: {len(list(redis_db.scan_iter('country:*')))}")
+    print(f"   - Sorted sets: 7 (ratings, budget, revenue, runtime, popularity, vote_count)")
 
 
 
